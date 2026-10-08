@@ -15,4 +15,7 @@ typedef struct {
 afk_sample afk_update(bool was_afk, double idle_seconds, double timeout);
 int afk_format_timestamp(char *buffer, size_t size, double unix_seconds);
 
+/* Sum of "not-afk" events in the server's events JSON, clipped to [from, to] unix seconds. */
+double afk_active_seconds(const char *json, double from, double to);
+
 #endif

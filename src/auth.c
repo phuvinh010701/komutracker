@@ -7,9 +7,9 @@
 #include <string.h>
 
 #ifdef _WIN32
-#include <windows.h>
 #include <bcrypt.h>
 #include <shellapi.h>
+#include <windows.h>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -64,27 +64,15 @@ static int random_bytes(unsigned char *out, size_t size) {
 #endif
 }
 
-int auth_generate_device_id(char *out, size_t size) {
-    if (size < 65) return -1;
-    unsigned char random[32];
-    if (random_bytes(random, sizeof(random))) return -1;
-    for (size_t i = 0; i < sizeof(random); i++) sprintf(out + i * 2, "%02x", random[i]);
-    out[64] = '\0';
-    return 0;
-}
-
-static int save_device_id(const char *device_id) {
-    char path[2048];
-    if (dirs_device_path(path, sizeof(path))) return -1;
-    return write_private(path, device_id);
-}
-
 int auth_get_device_id(char *out, size_t size) {
     if (size < 65) return -1;
     char path[2048];
     if (dirs_device_path(path, sizeof(path))) return -1;
     if (!read_file(path, out, size) && strlen(out) == 64) return 0;
-    if (auth_generate_device_id(out, size)) return -1;
+    unsigned char random[32];
+    if (random_bytes(random, sizeof(random))) return -1;
+    for (size_t i = 0; i < sizeof(random); i++) sprintf(out + i * 2, "%02x", random[i]);
+    out[64] = '\0';
     return write_private(path, out);
 }
 
@@ -101,34 +89,6 @@ int auth_save_token(const char *token) {
 int auth_remove_token(void) {
     char path[2048];
     if (dirs_token_path(path, sizeof(path))) return -1;
-    return remove(path) == 0 ? 0 : -1;
-}
-
-int auth_read_profile(char *name, size_t name_size, char *email, size_t email_size) {
-    char path[2048], value[1200];
-    if (!name || !name_size || !email || !email_size ||
-        dirs_profile_path(path, sizeof(path)) || read_file(path, value, sizeof(value))) return -1;
-    char *newline = strchr(value, '\n');
-    if (!newline) return -1;
-    *newline = '\0';
-    const char *saved_email = newline + 1;
-    if (!*value || strlen(value) >= name_size || strlen(saved_email) >= email_size) return -1;
-    strcpy(name, value);
-    strcpy(email, saved_email);
-    return 0;
-}
-
-int auth_save_profile(const char *name, const char *email) {
-    if (!name || !email || strchr(name, '\n') || strchr(email, '\n')) return -1;
-    char path[2048], value[1200];
-    if (dirs_profile_path(path, sizeof(path))) return -1;
-    int count = snprintf(value, sizeof(value), "%s\n%s", name, email);
-    return count < 0 || count >= (int)sizeof(value) ? -1 : write_private(path, value);
-}
-
-int auth_remove_profile(void) {
-    char path[2048];
-    if (dirs_profile_path(path, sizeof(path))) return -1;
     return remove(path) == 0 ? 0 : -1;
 }
 
@@ -173,14 +133,8 @@ int auth_open_browser(const char *url) {
 #endif
 }
 
-int auth_login(http_client *client, const auth_options *options,
-               char *device_id, size_t device_id_size,
-               char *token, size_t token_size, volatile sig_atomic_t *running) {
-    /* A device ID identifies one concrete authenticated session. Always rotate
-       it when OAuth actually starts so polling cannot reuse an older token. */
-    if (auth_generate_device_id(device_id, device_id_size)) return -1;
-    client->device_id = device_id;
-
+int auth_login(http_client *client, const auth_options *options, char *token, size_t token_size,
+               volatile sig_atomic_t *running) {
     char url[4096];
     if (auth_build_url(url, sizeof(url), options, client->device_id)) return -1;
     printf("Open this URL to log in:\n%s\n", url);
@@ -197,7 +151,7 @@ int auth_login(http_client *client, const auth_options *options,
             if (client->verbose)
                 fprintf(stderr, "komutracker %s: authentication poll attempt %d succeeded\n",
                         KOMUTRACKER_VERSION, attempt);
-            if (save_device_id(client->device_id) || auth_save_token(token)) return -1;
+            if (auth_save_token(token)) return -1;
             client->token = token;
             return http_auth_me(client, NULL, 0, NULL, 0) == HTTP_AUTH_OK ? 0 : -1;
         }

@@ -1,6 +1,6 @@
 # komutracker
 
-Native activity tracker written in C. KomuTracker is available as a desktop tray/menu-bar application and as a command-line client. It detects AFK state and sends ActivityWatch-compatible heartbeats without enumerating background processes.
+Native command-line activity tracker written in C. One process detects AFK state and sends ActivityWatch-compatible heartbeats to the server. It does not collect window titles or application names. By default it runs with a system tray / menu bar icon (`Login`/`Logout`, `Quit KomuTracker`); use `--no-tray` for the plain CLI.
 
 ## Install dependencies
 
@@ -10,8 +10,10 @@ The build requires the libcurl development library, not only the `curl` command-
 
 ```bash
 sudo apt update
-sudo apt install build-essential cmake pkg-config libcurl4-openssl-dev libx11-dev libxss-dev libgtk-3-dev libayatana-appindicator3-dev
+sudo apt install build-essential cmake pkg-config libcurl4-openssl-dev libx11-dev libxss-dev
 ```
+
+The tray icon needs `libgtk-3-0` and `libayatana-appindicator3-1` at runtime (loaded dynamically; without them, or without a display, komutracker falls back to CLI mode). On GNOME, install the AppIndicator shell extension to see the icon.
 
 Verify libcurl installation:
 
@@ -29,13 +31,13 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 ### Fedora/RHEL
 
 ```bash
-sudo dnf install gcc make cmake pkgconf-pkg-config libcurl-devel libX11-devel libXScrnSaver-devel gtk3-devel libappindicator-gtk3-devel
+sudo dnf install gcc make cmake pkgconf-pkg-config libcurl-devel libX11-devel libXScrnSaver-devel
 ```
 
 ### Arch Linux
 
 ```bash
-sudo pacman -S --needed base-devel cmake pkgconf curl libx11 libxss gtk3 libappindicator-gtk3
+sudo pacman -S --needed base-devel cmake pkgconf curl libx11 libxss
 ```
 
 ### macOS
@@ -61,7 +63,7 @@ Install Visual Studio Build Tools with the **Desktop development with C++** work
 ```powershell
 git clone https://github.com/microsoft/vcpkg.git
 .\vcpkg\bootstrap-vcpkg.bat
-.\vcpkg\vcpkg.exe install curl:x64-windows-static
+.\vcpkg\vcpkg.exe install curl:x64-windows
 ```
 
 Configure using the vcpkg toolchain from a Developer PowerShell:
@@ -69,7 +71,7 @@ Configure using the vcpkg toolchain from a Developer PowerShell:
 ```powershell
 cmake -S . -B build `
   -DCMAKE_TOOLCHAIN_FILE="C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake" `
-  -DVCPKG_TARGET_TRIPLET=x64-windows-static
+  -DVCPKG_TARGET_TRIPLET=x64-windows
 cmake --build build --config Release
 ```
 
@@ -89,44 +91,6 @@ CMake generates a Makefile in `build`, so after configuring you can also build w
 make -C build
 ```
 
-The build produces both the CLI and desktop application:
-
-- macOS: `build/KomuTracker.app` and `build/komutracker`.
-- Windows: `build/KomuTracker.exe` and `build/komutracker-cli.exe`.
-- Ubuntu: `build/komutracker-desktop` and `build/komutracker`.
-
-The desktop application only shows a tray/menu-bar icon. Use its menu to log in,
-log out, open the dashboard, inspect connection/tracking status, or quit.
-
-## Package a release
-
-Build packages on their native operating system after a Release build:
-
-```bash
-cpack --config build/CPackConfig.cmake -B dist
-```
-
-Generated artifacts are:
-
-- Windows: a ZIP containing the standalone GUI and CLI executables.
-- macOS: a DMG containing `KomuTracker.app`.
-- Ubuntu: a DEB that installs the executable, AppIndicator launcher, desktop entry, and icons.
-
-Public macOS and Windows releases should be code-signed. The generated local DMG and
-ZIP are otherwise complete but operating-system security prompts may identify them as
-coming from an unknown developer.
-
-On Ubuntu, install and launch the package with:
-
-```bash
-sudo apt install ./dist/komutracker-*-ubuntu-amd64.deb
-komutracker-desktop
-```
-
-The desktop entry uses `Terminal=false`, so launching KomuTracker from the Ubuntu
-application menu does not display a terminal. Git tags matching `v*` run the GitHub
-Actions workflow and attach all three platform packages to the release.
-
 ## Test
 
 ```bash
@@ -139,15 +103,35 @@ Or:
 make -C build test
 ```
 
+## Tray icon
+
+Running `./build/komutracker` with no login/daemon flags shows a tray icon (macOS menu bar, Windows notification area, Linux StatusNotifier). The menu shows the signed-in user, `Login` (opens the browser) or `Logout`, and `Quit KomuTracker`. Tracking starts after login and stops on logout. If the server is unreachable it retries every 30 seconds. Only one instance runs at a time.
+
+`--login`, `--logout`, `--status`, `--daemon` and `--no-tray` always use the CLI. On Windows the binary is a GUI-subsystem app (no console window); run from a terminal it still prints CLI output.
+
+## macOS app
+
+On macOS the build produces a menu-bar-only app bundle (no Dock icon), ad-hoc signed, linked against the system libcurl so it has no Homebrew dependency:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+open build/KomuTracker.app
+```
+
+Install by copying it to `/Applications`. Package for sharing:
+
+```bash
+ditto -c -k --keepParent build/KomuTracker.app KomuTracker.zip
+# or a disk image
+hdiutil create -volname KomuTracker -srcfolder build/KomuTracker.app -ov -format UDZO KomuTracker.dmg
+```
+
+CLI flags still work through the bundle binary, e.g. `build/KomuTracker.app/Contents/MacOS/KomuTracker --status`. No Screen Recording permission is needed. Ad-hoc signing means other Macs must right-click → Open the first time; a Developer ID signature and notarization are needed to avoid that.
+
 ## Login and run
 
-The API server defaults to `https://tracker.komu.vn`. The OAuth callback is `https://tracker.komu.vn/api/0/auth/callback`, matching the URL registered for the Mezon OAuth client.
-
-For normal desktop use, launch `KomuTracker.app`, `KomuTracker.exe`, or KomuTracker
-from Ubuntu's application menu. Select **Log In** from the tray menu; the browser opens
-for OAuth and the tray changes to the authenticated user's name when login completes.
-Selecting **Log Out** stops tracking and removes the saved credentials without closing
-the tray application.
+The API server defaults to `https://tracker-api.komu.vn`. The OAuth callback is `https://tracker-api.komu.vn/api/0/auth/callback`, matching the URL registered for the Mezon OAuth client.
 
 On first run, the CLI creates a device ID, opens the Mezon login page in the default browser, and waits for authentication. After login completes in the browser, control returns to the CLI and the token is saved for future runs.
 
@@ -189,9 +173,19 @@ Manual credentials remain supported for automation:
 
 ```bash
 ./build/komutracker \
-  --server https://tracker.komu.vn \
+  --server https://tracker-api.komu.vn \
   --token "YOUR_TOKEN" \
   --device-id "YOUR_DEVICE_ID"
+```
+
+Or configure them through environment variables:
+
+```bash
+export AW_SERVER_URL="https://tracker-api.komu.vn"
+export AW_AUTH_TOKEN="YOUR_TOKEN"
+export AW_DEVICE_ID="YOUR_DEVICE_ID"
+
+./build/komutracker
 ```
 
 Configure AFK timeout and polling:
@@ -199,7 +193,7 @@ Configure AFK timeout and polling:
 ```bash
 ./build/komutracker \
   --timeout 180 \
-  --poll-time 10 \
+  --poll-time 5 \
   --verbose
 ```
 
@@ -242,9 +236,7 @@ Only one instance runs at a time. Launching the command again while another inst
 -v, --verbose         Additionally print transport errors, the logged-in user, and bucket names
 --version, -V         Print the komutracker version and exit
 --timeout SECONDS     Idle time before AFK status
---poll-time SECONDS   AFK polling interval; default: 10
---window-poll-time SEC Foreground-process polling interval; default: 10
---exclude-title        Send `excluded` instead of the focused window title
+--poll-time SECONDS   AFK polling interval
 -d, --daemon           Detach and run in the background (single instance)
 --server URL          ActivityWatch-compatible server URL
 --token TOKEN         Bearer authentication token
@@ -261,9 +253,17 @@ Saved credentials:
 
 Token and device files use owner-only permissions on POSIX systems. Tokens are never printed by the CLI.
 
-Application defaults are defined once in `src/config.c` and shared by the desktop
-and CLI clients. KomuTracker does not read application settings or credentials from
-environment variables. The CLI flags above remain available for testing and automation.
+Environment variables:
+
+```text
+AW_SERVER_URL
+AW_AUTH_TOKEN
+AW_DEVICE_ID
+AW_AUTH_URL
+AW_CLIENT_ID
+AW_REDIRECT_URI
+AW_AUTH_TIMEOUT
+```
 
 ## Logs
 
@@ -271,9 +271,9 @@ All progress output is printed only with `-v`/`--verbose`; running without it is
 
 - **startup** — `komutracker 1.0.0 started for <server>`.
 - **authentication polling** — each poll of the token endpoint logs `authentication poll attempt N pending`, `… succeeded`, or `… failed` while waiting for the browser login to finish.
-- **data sends** — each window heartbeat logs `foreground-process heartbeat: OK` (or `FAILED`) and each AFK heartbeat logs `afk heartbeat: OK` (or `FAILED`).
+- **data sends** — each AFK heartbeat logs `afk heartbeat: OK` (or `FAILED`).
 
-With `-v`/`--verbose`, the CLI additionally logs the authenticated user (`logged in as <name> <<email>>`) and the two bucket names (`afk bucket: …`, `foreground-process bucket: …`) at startup, and prints the exact HTTP error reason for a failed request (timeout, bad status, etc.):
+With `-v`/`--verbose`, the CLI additionally logs the authenticated user (`logged in as <name> <<email>>`) and the bucket name (`afk bucket: …`) at startup, and prints the exact HTTP error reason for a failed request (timeout, bad status, etc.):
 
 ```bash
 ./build/komutracker --verbose
@@ -288,19 +288,14 @@ Check the version:
 
 ## Data sent
 
-The combined process publishes two buckets, named after the authenticated username (the part of the email before `@`, e.g. `nguyentran`):
+The process publishes one bucket, named after the authenticated username (the part of the email before `@`, e.g. `nguyentran`):
 
 - `aw-watcher-afk_<username>` / `afkstatus`: `afk` or `not-afk`.
-- `aw-watcher-window_<username>` / `currentwindow`: the focused process in `app` and its window title in `title`.
 
-Only the foreground process is sent. Background process lists are never collected. Use `--exclude-title` to avoid sending window titles:
-
-```bash
-./build/komutracker --exclude-title --window-poll-time 10
-```
+No window titles, application names, or process lists are collected.
 
 ## Platform backends
 
-- Windows: `GetForegroundWindow`, `QueryFullProcessImageName`, and `GetLastInputInfo`.
-- macOS: CoreGraphics window list and idle event APIs. Window titles may require Screen Recording permission.
-- Linux: X11 `_NET_ACTIVE_WINDOW`, process metadata, and XScreenSaver. A Wayland session without XWayland is not supported.
+- Windows: `GetLastInputInfo`.
+- macOS: CoreGraphics idle event API.
+- Linux: XScreenSaver. A Wayland session without XWayland is not supported.

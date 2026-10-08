@@ -1,114 +1,148 @@
 #if !defined(_WIN32) && !defined(__APPLE__)
-
+#define _GNU_SOURCE
 #include "tray.h"
+#include "tray_icon.h"
 
-#include <gtk/gtk.h>
-#ifdef KOMUTRACKER_USE_AYATANA
-#include <libayatana-appindicator/app-indicator.h>
-#else
-#include <libappindicator/app-indicator.h>
-#endif
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
-#ifndef KOMUTRACKER_TRAY_ICON_PATH
-#define KOMUTRACKER_TRAY_ICON_PATH "/usr/share/pixmaps/komutracker-tray.png"
-#endif
+/* GTK3 and appindicator are loaded at runtime so the binary still starts
+   (in CLI mode) on machines without them. */
+typedef void *W;
+static struct {
+    int (*init_check)(int *, char ***);
+    W (*menu_new)(void);
+    W (*item_new)(const char *);
+    W (*sep_new)(void);
+    void (*shell_append)(W, W);
+    void (*show)(W);
+    void (*hide)(W);
+    void (*set_sensitive)(W, int);
+    void (*set_label)(W, const char *);
+    void (*main_loop)(void);
+    void (*main_quit)(void);
+    unsigned long (*connect)(void *, const char *, void (*)(void), void *, void *, int);
+    unsigned (*idle_add)(int (*)(void *), void *);
+    W (*ind_new)(const char *, const char *, int, const char *);
+    void (*ind_status)(W, int);
+    void (*ind_menu)(W, W);
+    void (*ind_title)(W, const char *);
+    void (*ind_label)(W, const char *, const char *);
+} g;
 
-static tray_callbacks callbacks;
-static AppIndicator *indicator;
-static GtkWidget *menu;
-static GtkWidget *account_item;
-static GtkWidget *status_item;
-static GtkWidget *dashboard_item;
-static GtkWidget *auth_item;
-static GtkWidget *logout_item;
+static void (*click_cb)(int);
+static W indicator;
+static W widgets[TRAY_MAX_ITEMS];
+static int loaded;
+static char icon_dir[64], icon_file[96];
 
-static void auth_action(GtkMenuItem *item, gpointer context) {
-    (void)item;
-    (void)context;
-    if (callbacks.auth_action) callbacks.auth_action(callbacks.context);
+static void *sym(void *lib, const char *name) { return lib ? dlsym(lib, name) : NULL; }
+
+static int load(void) {
+    if (loaded) return loaded > 0;
+    loaded = -1;
+    void *gtk = dlopen("libgtk-3.so.0", RTLD_NOW | RTLD_GLOBAL);
+    void *ind = dlopen("libayatana-appindicator3.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (!ind) ind = dlopen("libappindicator3.so.1", RTLD_NOW | RTLD_GLOBAL);
+    if (!gtk || !ind) return 0;
+    *(void **)&g.init_check = sym(gtk, "gtk_init_check");
+    *(void **)&g.menu_new = sym(gtk, "gtk_menu_new");
+    *(void **)&g.item_new = sym(gtk, "gtk_menu_item_new_with_label");
+    *(void **)&g.sep_new = sym(gtk, "gtk_separator_menu_item_new");
+    *(void **)&g.shell_append = sym(gtk, "gtk_menu_shell_append");
+    *(void **)&g.show = sym(gtk, "gtk_widget_show");
+    *(void **)&g.hide = sym(gtk, "gtk_widget_hide");
+    *(void **)&g.set_sensitive = sym(gtk, "gtk_widget_set_sensitive");
+    *(void **)&g.set_label = sym(gtk, "gtk_menu_item_set_label");
+    *(void **)&g.main_loop = sym(gtk, "gtk_main");
+    *(void **)&g.main_quit = sym(gtk, "gtk_main_quit");
+    *(void **)&g.connect = sym(gtk, "g_signal_connect_data");
+    *(void **)&g.idle_add = sym(gtk, "g_idle_add");
+    *(void **)&g.ind_new = sym(ind, "app_indicator_new_with_path");
+    *(void **)&g.ind_status = sym(ind, "app_indicator_set_status");
+    *(void **)&g.ind_menu = sym(ind, "app_indicator_set_menu");
+    *(void **)&g.ind_title = sym(ind, "app_indicator_set_title");
+    *(void **)&g.ind_label = sym(ind, "app_indicator_set_label");
+    void **fn = (void **)&g;
+    for (size_t i = 0; i < sizeof(g) / sizeof(*fn); i++) if (!fn[i]) return 0;
+    loaded = 1;
+    return 1;
 }
 
-static void logout_action(GtkMenuItem *item, gpointer context) {
-    (void)item;
-    (void)context;
-    if (callbacks.logout) callbacks.logout(callbacks.context);
+int tray_available(void) {
+    const char *x = getenv("DISPLAY"), *w = getenv("WAYLAND_DISPLAY");
+    return ((x && *x) || (w && *w)) && load();
 }
 
-static void dashboard_action(GtkMenuItem *item, gpointer context) {
-    (void)item;
-    (void)context;
-    if (callbacks.open_dashboard) callbacks.open_dashboard(callbacks.context);
-}
+static void on_activate(void *item, void *data) { (void)item; if (click_cb) click_cb((int)(long)data); }
 
-static void quit_action(GtkMenuItem *item, gpointer context) {
-    (void)item;
-    (void)context;
-    if (callbacks.quit) callbacks.quit(callbacks.context);
-}
-
-static GtkWidget *new_item(const char *label, GCallback callback) {
-    GtkWidget *item = gtk_menu_item_new_with_label(label);
-    if (callback) g_signal_connect(item, "activate", callback, NULL);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
-    return item;
-}
-
-int tray_init(const tray_callbacks *provided_callbacks) {
-    callbacks = *provided_callbacks;
-    if (!gtk_init_check(NULL, NULL)) return -1;
-
-    indicator = app_indicator_new("komutracker", "komutracker-tray",
-                                  APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
-    if (!indicator) return -1;
-    app_indicator_set_icon_full(indicator, KOMUTRACKER_TRAY_ICON_PATH, "KomuTracker");
-    app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
-
-    menu = gtk_menu_new();
-    account_item = new_item("Not Logged In", NULL);
-    status_item = new_item("Starting…", NULL);
-    gtk_widget_set_sensitive(account_item, FALSE);
-    gtk_widget_set_sensitive(status_item, FALSE);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-    dashboard_item = new_item("Open Dashboard", G_CALLBACK(dashboard_action));
-    auth_item = new_item("Log In", G_CALLBACK(auth_action));
-    logout_item = new_item("Log Out", G_CALLBACK(logout_action));
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-    new_item("Quit KomuTracker", G_CALLBACK(quit_action));
-
-    gtk_widget_show_all(menu);
-    app_indicator_set_menu(indicator, GTK_MENU(menu));
-    return 0;
-}
-
-void tray_update(const tray_view *view) {
-    gtk_menu_item_set_label(GTK_MENU_ITEM(account_item), view->account_name);
-    gtk_menu_item_set_label(GTK_MENU_ITEM(status_item), view->status_text);
-    gtk_widget_set_sensitive(dashboard_item, view->logged_in);
-
-    if (view->status == TRAY_AUTHENTICATING) {
-        gtk_menu_item_set_label(GTK_MENU_ITEM(auth_item), "Cancel Login");
-        gtk_widget_show(auth_item);
-        gtk_widget_hide(logout_item);
-    } else if (view->logged_in) {
-        gtk_widget_hide(auth_item);
-        gtk_widget_show(logout_item);
-    } else {
-        gtk_menu_item_set_label(GTK_MENU_ITEM(auth_item), "Log In");
-        gtk_widget_show(auth_item);
-        gtk_widget_hide(logout_item);
+static void apply(const tray_menu *menu) {
+    for (int i = 0; i < menu->count; i++) {
+        if (!widgets[i] || !strcmp(menu->items[i].label, "-")) continue;
+        g.set_label(widgets[i], menu->items[i].label);
+        g.set_sensitive(widgets[i], menu->items[i].enabled);
+        if (menu->items[i].visible) g.show(widgets[i]); else g.hide(widgets[i]);
     }
 }
 
-void tray_poll(void) {
-    while (gtk_events_pending()) gtk_main_iteration_do(FALSE);
+static int apply_idle(void *data) { apply(data); free(data); return 0; }
+static int quit_idle(void *data) { (void)data; g.main_quit(); return 0; }
+
+int tray_init(const char *tooltip, const tray_menu *menu, void (*on_click)(int)) {
+    if (!load() || !g.init_check(NULL, NULL)) return -1;
+    click_cb = on_click;
+    /* appindicator only takes icons by theme name/path, so write the embedded PNG to a temp dir. */
+    snprintf(icon_dir, sizeof(icon_dir), "/tmp/komutracker-%d", (int)getpid());
+    snprintf(icon_file, sizeof(icon_file), "%s/komutracker.png", icon_dir);
+    if (mkdir(icon_dir, 0700) && access(icon_dir, W_OK)) return -1;
+    FILE *f = fopen(icon_file, "wb");
+    if (!f) return -1;
+    fwrite(tray_icon_linux, 1, sizeof(tray_icon_linux), f);
+    fclose(f);
+
+    W ind = g.ind_new("komutracker", "komutracker", 0 /* APPLICATION_STATUS */, icon_dir);
+    if (!ind) return -1;
+    indicator = ind;
+    g.ind_title(ind, tooltip);
+    W ui_menu = g.menu_new();
+    for (int i = 0; i < menu->count; i++) {
+        if (!strcmp(menu->items[i].label, "-")) {
+            W sep = g.sep_new();
+            g.shell_append(ui_menu, sep); g.show(sep);
+            continue;
+        }
+        widgets[i] = g.item_new("");
+        g.connect(widgets[i], "activate", (void (*)(void))on_activate, (void *)(long)menu->items[i].id, NULL, 0);
+        g.shell_append(ui_menu, widgets[i]);
+    }
+    apply(menu);
+    g.ind_menu(ind, ui_menu);
+    g.ind_status(ind, 1 /* ACTIVE */);
+    return 0;
 }
 
-void tray_cleanup(void) {
-    if (indicator) app_indicator_set_status(indicator, APP_INDICATOR_STATUS_PASSIVE);
-    if (menu) gtk_widget_destroy(menu);
-    if (indicator) g_object_unref(indicator);
-    indicator = NULL;
-    menu = NULL;
+void tray_set_menu(const tray_menu *menu) {
+    tray_menu *copy = malloc(sizeof(*copy));
+    if (!copy) return;
+    *copy = *menu;
+    g.idle_add(apply_idle, copy);
 }
 
+static int label_idle(void *text) { g.ind_label(indicator, text, "Active: 00h 00m"); free(text); return 0; }
+
+void tray_set_label(const char *text) {
+    char *copy = strdup(text);
+    if (copy) g.idle_add(label_idle, copy);
+}
+
+void tray_run(void) {
+    g.main_loop();
+    unlink(icon_file); rmdir(icon_dir);
+}
+
+void tray_quit(void) { g.idle_add(quit_idle, NULL); }
 #endif

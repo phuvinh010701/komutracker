@@ -1,4 +1,0 @@
-#include <windows.h>
-
-101 ICON "KomuTracker.ico"
-102 ICON "KomuTrackerTray.ico"

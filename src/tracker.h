@@ -1,42 +1,31 @@
-#ifndef KOMUTRACKER_TRACKER_H
-#define KOMUTRACKER_TRACKER_H
+#ifndef TRACKER_TRACKER_H
+#define TRACKER_TRACKER_H
 
+#include "auth.h"
 #include "http.h"
-
+#include <signal.h>
 #include <stdbool.h>
-#include <stddef.h>
-
-typedef void (*tracker_send_callback)(void *context, const char *event, int result);
 
 typedef struct {
-    double afk_timeout_seconds;
-    double afk_poll_seconds;
-    double window_poll_seconds;
-    bool exclude_window_title;
-    tracker_send_callback on_send;
-    void *callback_context;
-} tracker_options;
+    double timeout, poll_time;
+    bool verbose;
+    void (*on_minute)(const http_client *); /* optional; called about once a minute from the tracking thread */
+} tracker_config;
+
+/* Blocks, sending heartbeats until *running or *session becomes 0.
+   Returns 0 on a clean stop, non-zero if the platform backends cannot start. */
+int tracker_run(const http_client *client, const tracker_config *config,
+                volatile sig_atomic_t *running, volatile sig_atomic_t *session);
+
+void tracker_sleep(double seconds);
 
 typedef struct {
-    http_client *client;
-    tracker_options options;
-    char hostname[256];
-    char username[512];
-    char afk_bucket[1024];
-    char window_bucket[1024];
-    bool idle_available;
-    bool window_available;
-    bool afk;
-    double next_afk;
-    double next_window;
-} tracker_session;
+    const char *server, *token_arg, *device_id;
+    auth_options auth;
+    tracker_config track;
+} app_config;
 
-double tracker_now_seconds(void);
-void tracker_sleep_seconds(double seconds);
-int tracker_session_init(tracker_session *session, http_client *client,
-                         const char *email, const tracker_options *options);
-int tracker_session_poll(tracker_session *session);
-double tracker_session_delay(const tracker_session *session);
-void tracker_session_cleanup(tracker_session *session);
+/* Tray mode: owns the calling (main) thread until Quit or *running == 0. */
+int tray_app_run(const app_config *config, volatile sig_atomic_t *running);
 
 #endif

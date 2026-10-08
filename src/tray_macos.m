@@ -1,152 +1,89 @@
 #ifdef __APPLE__
-
 #import <Cocoa/Cocoa.h>
-
 #include "tray.h"
+#include "tray_icon.h"
+#include <stdlib.h>
 
-static tray_callbacks callbacks;
+@interface TrayTarget : NSObject
+- (void)clicked:(NSMenuItem *)sender;
+@end
+
+static void (*click_cb)(int);
+static TrayTarget *target;
 static NSStatusItem *status_item;
-static NSMenu *status_menu;
-static NSMenuItem *account_item;
-static NSMenuItem *state_item;
-static NSMenuItem *dashboard_item;
-static NSMenuItem *auth_item;
-static NSMenuItem *logout_item;
-static NSAutoreleasePool *autorelease_pool;
+static NSMutableArray<NSMenuItem *> *menu_items; /* NSNull for separators */
 
-@interface KomuTrackerTrayTarget : NSObject
-- (void)authAction:(id)sender;
-- (void)logout:(id)sender;
-- (void)openDashboard:(id)sender;
-- (void)quit:(id)sender;
+@implementation TrayTarget
+- (void)clicked:(NSMenuItem *)sender { if (click_cb) click_cb((int)sender.tag); }
 @end
 
-@implementation KomuTrackerTrayTarget
-- (void)authAction:(id)sender {
-    (void)sender;
-    if (callbacks.auth_action) callbacks.auth_action(callbacks.context);
-}
-- (void)logout:(id)sender {
-    (void)sender;
-    if (callbacks.logout) callbacks.logout(callbacks.context);
-}
-- (void)openDashboard:(id)sender {
-    (void)sender;
-    if (callbacks.open_dashboard) callbacks.open_dashboard(callbacks.context);
-}
-- (void)quit:(id)sender {
-    (void)sender;
-    if (callbacks.quit) callbacks.quit(callbacks.context);
-}
-@end
+int tray_available(void) { return 1; }
 
-static KomuTrackerTrayTarget *target;
-
-int tray_init(const tray_callbacks *provided_callbacks) {
-    callbacks = *provided_callbacks;
-    autorelease_pool = [[NSAutoreleasePool alloc] init];
-    [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-    [NSApp finishLaunching];
-
-    target = [[KomuTrackerTrayTarget alloc] init];
-    status_item = [[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength];
-    [status_item retain];
-
-    NSString *icon_path = [[NSBundle mainBundle] pathForResource:@"logo" ofType:@"png"];
-    NSImage *icon = icon_path ? [[NSImage alloc] initWithContentsOfFile:icon_path] : nil;
-    if (icon) {
-        [icon setSize:NSMakeSize(18.0, 18.0)];
-        status_item.button.image = icon;
-        [icon release];
-    } else {
-        status_item.button.title = @"K";
+static void apply(const tray_menu *menu) {
+    for (int i = 0; i < menu->count && i < (int)menu_items.count; i++) {
+        NSMenuItem *item = menu_items[i];
+        if ((id)item == [NSNull null]) continue;
+        item.title = [NSString stringWithUTF8String:menu->items[i].label];
+        item.enabled = menu->items[i].enabled != 0;
+        item.hidden = menu->items[i].visible == 0;
     }
-    status_item.button.toolTip = @"KomuTracker";
+}
 
-    status_menu = [[NSMenu alloc] initWithTitle:@"KomuTracker"];
-    account_item = [[NSMenuItem alloc] initWithTitle:@"Not Logged In" action:nil keyEquivalent:@""];
-    state_item = [[NSMenuItem alloc] initWithTitle:@"Starting…" action:nil keyEquivalent:@""];
-    [account_item setEnabled:NO];
-    [state_item setEnabled:NO];
-    [status_menu addItem:account_item];
-    [status_menu addItem:state_item];
-    [status_menu addItem:[NSMenuItem separatorItem]];
+int tray_init(const char *tooltip, const tray_menu *menu, void (*on_click)(int)) {
+    @autoreleasepool {
+        click_cb = on_click;
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        target = [TrayTarget new];
+        status_item = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+        if (!status_item) return -1;
+        NSData *data = [NSData dataWithBytes:tray_icon_mac length:sizeof(tray_icon_mac)];
+        NSImage *image = [[NSImage alloc] initWithData:data];
+        [image setSize:NSMakeSize(18, 18)];
+        [image setTemplate:YES];
+        status_item.button.image = image;
+        status_item.button.toolTip = [NSString stringWithUTF8String:tooltip];
 
-    dashboard_item = [[NSMenuItem alloc] initWithTitle:@"Open Dashboard"
-                                                action:@selector(openDashboard:)
-                                         keyEquivalent:@""];
-    dashboard_item.target = target;
-    [status_menu addItem:dashboard_item];
-
-    auth_item = [[NSMenuItem alloc] initWithTitle:@"Log In"
-                                           action:@selector(authAction:)
-                                    keyEquivalent:@""];
-    auth_item.target = target;
-    [status_menu addItem:auth_item];
-
-    logout_item = [[NSMenuItem alloc] initWithTitle:@"Log Out"
-                                             action:@selector(logout:)
-                                      keyEquivalent:@""];
-    logout_item.target = target;
-    [status_menu addItem:logout_item];
-    [status_menu addItem:[NSMenuItem separatorItem]];
-
-    NSMenuItem *quit_item = [[NSMenuItem alloc] initWithTitle:@"Quit KomuTracker"
-                                                       action:@selector(quit:)
-                                                keyEquivalent:@"q"];
-    quit_item.target = target;
-    [status_menu addItem:quit_item];
-    [quit_item release];
-
-    status_item.menu = status_menu;
+        NSMenu *ns_menu = [NSMenu new];
+        ns_menu.autoenablesItems = NO;
+        menu_items = [NSMutableArray new];
+        for (int i = 0; i < menu->count; i++) {
+            if (!strcmp(menu->items[i].label, "-")) {
+                [ns_menu addItem:[NSMenuItem separatorItem]];
+                [menu_items addObject:(id)[NSNull null]];
+                continue;
+            }
+            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"" action:@selector(clicked:) keyEquivalent:@""];
+            item.target = target;
+            item.tag = menu->items[i].id;
+            [ns_menu addItem:item];
+            [menu_items addObject:item];
+        }
+        status_item.menu = ns_menu;
+        apply(menu);
+    }
     return 0;
 }
 
-void tray_update(const tray_view *view) {
-    account_item.title = [NSString stringWithUTF8String:view->account_name];
-    state_item.title = [NSString stringWithUTF8String:view->status_text];
-    dashboard_item.enabled = view->logged_in;
-
-    BOOL authenticating = view->status == TRAY_AUTHENTICATING;
-    auth_item.hidden = view->logged_in && !authenticating;
-    auth_item.title = authenticating ? @"Cancel Login" : @"Log In";
-    logout_item.hidden = !view->logged_in || authenticating;
-
-    NSString *tooltip = [NSString stringWithFormat:@"KomuTracker — %@ — %@",
-                          account_item.title, state_item.title];
-    status_item.button.toolTip = tooltip;
+void tray_set_menu(const tray_menu *menu) {
+    tray_menu *copy = malloc(sizeof(*copy));
+    if (!copy) return;
+    *copy = *menu;
+    dispatch_async(dispatch_get_main_queue(), ^{ apply(copy); free(copy); });
 }
 
-void tray_poll(void) {
-    for (;;) {
-        NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                            untilDate:[NSDate date]
-                                               inMode:NSDefaultRunLoopMode
-                                              dequeue:YES];
-        if (!event) break;
-        [NSApp sendEvent:event];
-    }
-    [NSApp updateWindows];
-    [autorelease_pool drain];
-    autorelease_pool = [[NSAutoreleasePool alloc] init];
-}
+void tray_run(void) { [NSApp run]; }
 
-void tray_cleanup(void) {
-    if (status_item) {
+void tray_set_label(const char *text) { (void)text; }
+
+void tray_quit(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
         [[NSStatusBar systemStatusBar] removeStatusItem:status_item];
-        [status_item release];
-        status_item = nil;
-    }
-    [account_item release];
-    [state_item release];
-    [dashboard_item release];
-    [auth_item release];
-    [logout_item release];
-    [status_menu release];
-    [target release];
-    [autorelease_pool drain];
-    autorelease_pool = nil;
+        [NSApp stop:nil];
+        /* stop: only takes effect after an event; post a dummy one to wake the loop. */
+        [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint
+                                       modifierFlags:0 timestamp:0 windowNumber:0 context:nil
+                                             subtype:0 data1:0 data2:0] atStart:YES];
+    });
 }
-
 #endif

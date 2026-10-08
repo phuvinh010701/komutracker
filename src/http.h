@@ -17,12 +17,6 @@ typedef struct {
 } http_client;
 
 enum {
-    HTTP_RESULT_UNAUTHORIZED = -2,
-    HTTP_RESULT_ERROR = -1,
-    HTTP_RESULT_OK = 0
-};
-
-enum {
     HTTP_AUTH_ERROR = -1,
     HTTP_AUTH_PENDING = 0,
     HTTP_AUTH_OK = 1,
@@ -36,9 +30,8 @@ int http_create_bucket(const http_client *client, const char *bucket, const char
                        const char *event_type, const char *hostname);
 int http_heartbeat(const http_client *client, const char *bucket, const char *timestamp,
                    double duration, bool afk, double pulsetime);
-int http_heartbeat_window(const http_client *client, const char *bucket, const char *timestamp,
-                          const char *app, const char *title, double pulsetime);
-int http_json_escape(const char *source, char *out, size_t size);
+int http_get_events(const http_client *client, const char *user, const char *start, const char *end,
+                    char *response, size_t response_size);
 int http_auth_poll(const http_client *client, char *token, size_t token_size);
 int http_auth_me(const http_client *client, char *name, size_t name_size,
                  char *email, size_t email_size);

@@ -1,158 +1,101 @@
 #ifdef _WIN32
-
-#include "desktop.h"
 #include "tray.h"
-
 #include <windows.h>
 #include <shellapi.h>
-#include <wchar.h>
+#include <string.h>
 
-#define IDI_KOMUTRACKER_APP 101
-#define IDI_KOMUTRACKER_TRAY 102
-#define WM_KOMUTRACKER_TRAY (WM_APP + 42)
-#define MENU_DASHBOARD 2001
-#define MENU_AUTH 2002
-#define MENU_LOGOUT 2003
-#define MENU_QUIT 2004
+#define WM_TRAY (WM_APP + 1)
+#define ICON_UID 1
+#define RES_ICON 1 /* komutracker.rc */
 
-static const wchar_t *WINDOW_CLASS = L"KomuTrackerTrayWindow";
-static tray_callbacks callbacks;
-static tray_view current_view;
-static HWND window_handle;
-static NOTIFYICONDATAW notify_icon;
+static void (*click_cb)(int);
+static HWND window;
+static NOTIFYICONDATAA nid;
 static UINT taskbar_created;
+static tray_menu current;
+static CRITICAL_SECTION lock;
+static char tip[128];
 
-static void utf8_to_wide(const char *source, wchar_t *target, int target_size) {
-    if (!source || MultiByteToWideChar(CP_UTF8, 0, source, -1, target, target_size) <= 0) {
-        if (target_size) target[0] = L'\0';
-    }
-}
+int tray_available(void) { return 1; }
 
-static void add_notify_icon(void) {
-    notify_icon.cbSize = sizeof(notify_icon);
-    notify_icon.hWnd = window_handle;
-    notify_icon.uID = 1;
-    notify_icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    notify_icon.uCallbackMessage = WM_KOMUTRACKER_TRAY;
-    notify_icon.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_KOMUTRACKER_TRAY));
-    wcscpy_s(notify_icon.szTip, ARRAYSIZE(notify_icon.szTip), L"KomuTracker");
-    Shell_NotifyIconW(NIM_ADD, &notify_icon);
-    notify_icon.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconW(NIM_SETVERSION, &notify_icon);
+static void add_icon(void) {
+    memset(&nid, 0, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = window;
+    nid.uID = ICON_UID;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY;
+    nid.hIcon = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(RES_ICON));
+    if (!nid.hIcon) nid.hIcon = LoadIconA(NULL, IDI_APPLICATION);
+    strncpy(nid.szTip, tip, sizeof(nid.szTip) - 1);
+    Shell_NotifyIconA(NIM_ADD, &nid);
 }
 
 static void show_menu(void) {
-    HMENU menu = CreatePopupMenu();
-    if (!menu) return;
-
-    wchar_t account[512], status[256];
-    utf8_to_wide(current_view.account_name, account, ARRAYSIZE(account));
-    utf8_to_wide(current_view.status_text, status, ARRAYSIZE(status));
-    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, account);
-    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, status);
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (current_view.logged_in ? 0 : MF_GRAYED),
-                MENU_DASHBOARD, L"Open Dashboard");
-    if (current_view.status == TRAY_AUTHENTICATING)
-        AppendMenuW(menu, MF_STRING, MENU_AUTH, L"Cancel Login");
-    else if (!current_view.logged_in)
-        AppendMenuW(menu, MF_STRING, MENU_AUTH, L"Log In");
-    else
-        AppendMenuW(menu, MF_STRING, MENU_LOGOUT, L"Log Out");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, MENU_QUIT, L"Quit KomuTracker");
-
-    POINT position;
-    GetCursorPos(&position);
-    SetForegroundWindow(window_handle);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-                   position.x, position.y, 0, window_handle, NULL);
-    PostMessageW(window_handle, WM_NULL, 0, 0);
-    DestroyMenu(menu);
+    HMENU popup = CreatePopupMenu();
+    if (!popup) return;
+    EnterCriticalSection(&lock);
+    int pending_separator = 0, added = 0;
+    for (int i = 0; i < current.count; i++) {
+        const tray_item *item = &current.items[i];
+        if (!strcmp(item->label, "-")) { pending_separator = added; continue; }
+        if (!item->visible) continue;
+        if (pending_separator) { AppendMenuA(popup, MF_SEPARATOR, 0, NULL); pending_separator = 0; }
+        AppendMenuA(popup, MF_STRING | (item->enabled ? MF_ENABLED : MF_GRAYED), (UINT_PTR)item->id, item->label);
+        added++;
+    }
+    LeaveCriticalSection(&lock);
+    POINT pt; GetCursorPos(&pt);
+    SetForegroundWindow(window); /* required so the menu closes when clicking elsewhere */
+    int id = (int)TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, 0, window, NULL);
+    PostMessageA(window, WM_NULL, 0, 0);
+    DestroyMenu(popup);
+    if (id && click_cb) click_cb(id);
 }
 
-static LRESULT CALLBACK tray_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-    if (message == taskbar_created) {
-        add_notify_icon();
+static LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_TRAY) {
+        if (lp == WM_LBUTTONUP || lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) show_menu();
         return 0;
     }
-    if (message == WM_KOMUTRACKER_TRAY) {
-        UINT event = LOWORD(lparam);
-        if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP) show_menu();
-        else if (event == WM_LBUTTONDBLCLK && current_view.logged_in && callbacks.open_dashboard)
-            callbacks.open_dashboard(callbacks.context);
+    if (msg == taskbar_created && taskbar_created) { add_icon(); return 0; } /* explorer restarted */
+    if (msg == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
+    if (msg == WM_DESTROY) {
+        Shell_NotifyIconA(NIM_DELETE, &nid);
+        PostQuitMessage(0);
         return 0;
     }
-    if (message == WM_COMMAND) {
-        switch (LOWORD(wparam)) {
-            case MENU_DASHBOARD:
-                if (callbacks.open_dashboard) callbacks.open_dashboard(callbacks.context);
-                break;
-            case MENU_AUTH:
-                if (callbacks.auth_action) callbacks.auth_action(callbacks.context);
-                break;
-            case MENU_LOGOUT:
-                if (callbacks.logout) callbacks.logout(callbacks.context);
-                break;
-            case MENU_QUIT:
-                if (callbacks.quit) callbacks.quit(callbacks.context);
-                break;
-        }
-        return 0;
-    }
-    return DefWindowProcW(window, message, wparam, lparam);
+    return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-int tray_init(const tray_callbacks *provided_callbacks) {
-    callbacks = *provided_callbacks;
-    HINSTANCE instance = GetModuleHandleW(NULL);
-    WNDCLASSEXW window_class = {0};
-    window_class.cbSize = sizeof(window_class);
-    window_class.lpfnWndProc = tray_window_proc;
-    window_class.hInstance = instance;
-    window_class.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_KOMUTRACKER_APP));
-    window_class.lpszClassName = WINDOW_CLASS;
-    if (!RegisterClassExW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return -1;
-
-    window_handle = CreateWindowExW(0, WINDOW_CLASS, L"KomuTracker", 0,
-                                    0, 0, 0, 0, HWND_MESSAGE, NULL, instance, NULL);
-    if (!window_handle) return -1;
-    taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
-    add_notify_icon();
+int tray_init(const char *tooltip, const tray_menu *menu, void (*on_click)(int)) {
+    click_cb = on_click;
+    InitializeCriticalSection(&lock);
+    current = *menu;
+    strncpy(tip, tooltip, sizeof(tip) - 1);
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = proc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "KomuTrackerTray";
+    if (!RegisterClassA(&wc)) return -1;
+    window = CreateWindowExA(0, wc.lpszClassName, "KomuTracker", 0, 0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
+    if (!window) return -1;
+    taskbar_created = RegisterWindowMessageA("TaskbarCreated");
+    add_icon();
     return 0;
 }
 
-void tray_update(const tray_view *view) {
-    current_view = *view;
-    wchar_t account[64], status[48];
-    utf8_to_wide(view->account_name, account, ARRAYSIZE(account));
-    utf8_to_wide(view->status_text, status, ARRAYSIZE(status));
-    _snwprintf_s(notify_icon.szTip, ARRAYSIZE(notify_icon.szTip), _TRUNCATE,
-                 L"KomuTracker\n%s\n%s", account, status);
-    notify_icon.uFlags = NIF_TIP;
-    Shell_NotifyIconW(NIM_MODIFY, &notify_icon);
+void tray_set_menu(const tray_menu *menu) {
+    EnterCriticalSection(&lock);
+    current = *menu;
+    LeaveCriticalSection(&lock);
 }
 
-void tray_poll(void) {
-    MSG message;
-    while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-    }
+void tray_run(void) {
+    MSG msg;
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
 }
 
-void tray_cleanup(void) {
-    Shell_NotifyIconW(NIM_DELETE, &notify_icon);
-    if (window_handle) DestroyWindow(window_handle);
-    window_handle = NULL;
-}
-
-int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, int show_command) {
-    (void)instance;
-    (void)previous;
-    (void)command_line;
-    (void)show_command;
-    return komutracker_desktop_main();
-}
-
+void tray_set_label(const char *text) { (void)text; }
+void tray_quit(void) { PostMessageA(window, WM_CLOSE, 0, 0); }
 #endif
