@@ -1,34 +1,33 @@
-#ifndef KOMUTRACKER_TRAY_H
-#define KOMUTRACKER_TRAY_H
+#ifndef TRACKER_TRAY_H
+#define TRACKER_TRAY_H
 
-#include <stdbool.h>
+#define TRAY_MAX_ITEMS 8
 
-typedef enum {
-    TRAY_LOGGED_OUT,
-    TRAY_AUTHENTICATING,
-    TRAY_CONNECTING,
-    TRAY_TRACKING,
-    TRAY_CONNECTION_ERROR
-} tray_status;
+/* label "-" is a separator. */
+typedef struct {
+    char label[160];
+    int id;
+    int enabled;
+    int visible;
+} tray_item;
 
 typedef struct {
-    void (*auth_action)(void *context);
-    void (*logout)(void *context);
-    void (*open_dashboard)(void *context);
-    void (*quit)(void *context);
-    void *context;
-} tray_callbacks;
+    int count;
+    tray_item items[TRAY_MAX_ITEMS];
+} tray_menu;
 
-typedef struct {
-    tray_status status;
-    bool logged_in;
-    char account_name[512];
-    char status_text[256];
-} tray_view;
-
-int tray_init(const tray_callbacks *callbacks);
-void tray_update(const tray_view *view);
-void tray_poll(void);
-void tray_cleanup(void);
+/* 1 if a tray can be shown in this environment (Linux: GTK3 + appindicator + display). */
+int tray_available(void);
+/* Main thread. The layout (count, separators, ids) is fixed by `menu`;
+   on_click(id) runs on the UI thread and must not block. Returns 0 on success. */
+int tray_init(const char *tooltip, const tray_menu *menu, void (*on_click)(int id));
+/* Any thread: updates label/enabled/visible of the items by index. */
+void tray_set_menu(const tray_menu *menu);
+/* Main thread: runs the UI loop until tray_quit(). */
+void tray_run(void);
+/* Any thread: text shown next to the icon ("" clears it). Linux only; no-op elsewhere. */
+void tray_set_label(const char *text);
+/* Any thread. */
+void tray_quit(void);
 
 #endif

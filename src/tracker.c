@@ -1,34 +1,20 @@
 #include "tracker.h"
-
 #include "afk.h"
 #include "idle.h"
-#include "window.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <unistd.h>
 #endif
 
-double tracker_now_seconds(void) {
-#ifdef _WIN32
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    ULARGE_INTEGER value = { .LowPart = ft.dwLowDateTime, .HighPart = ft.dwHighDateTime };
-    return (double)(value.QuadPart - 116444736000000000ULL) / 10000000.0;
-#else
-    struct timespec value;
-    clock_gettime(CLOCK_REALTIME, &value);
-    return (double)value.tv_sec + (double)value.tv_nsec / 1000000000.0;
-#endif
-}
+static bool verbose_logging;
 
-void tracker_sleep_seconds(double seconds) {
-    if (seconds < 0.0) seconds = 0.0;
+void tracker_sleep(double seconds) {
 #ifdef _WIN32
     Sleep((DWORD)(seconds * 1000.0));
 #else
@@ -36,138 +22,125 @@ void tracker_sleep_seconds(double seconds) {
 #endif
 }
 
+static double now_seconds(void) {
+#ifdef _WIN32
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER value = { .LowPart = ft.dwLowDateTime, .HighPart = ft.dwHighDateTime };
+    return (double)(value.QuadPart - 116444736000000000ULL) / 10000000.0;
+#else
+    struct timespec value; clock_gettime(CLOCK_REALTIME, &value);
+    return (double)value.tv_sec + (double)value.tv_nsec / 1000000000.0;
+#endif
+}
+
+static int now_local(char *buffer, size_t size) {
+    time_t whole = time(NULL);
+    struct tm local;
+#ifdef _WIN32
+    if (localtime_s(&local, &whole) != 0) return -1;
+#else
+    if (localtime_r(&whole, &local) == NULL) return -1;
+#endif
+    return snprintf(buffer, size, "%02d:%02d:%02d", local.tm_hour, local.tm_min, local.tm_sec) >= (int)size ? -1 : 0;
+}
+
 static int get_hostname(char *buffer, size_t size) {
 #ifdef _WIN32
-    DWORD length = (DWORD)size;
-    return GetComputerNameA(buffer, &length) ? 0 : -1;
+    DWORD length = (DWORD)size; return GetComputerNameA(buffer, &length) ? 0 : -1;
 #else
     return gethostname(buffer, size) == 0 ? 0 : -1;
 #endif
 }
 
-static int report_send(tracker_session *session, const char *event, int result) {
-    if (session->options.on_send)
-        session->options.on_send(session->options.callback_context, event, result);
-    return result;
+static void log_send(const char *event, int result) {
+    if (!verbose_logging) return;
+    char stamp[16];
+    if (now_local(stamp, sizeof(stamp)) == 0)
+        fprintf(stderr, "komutracker %s [%s] %s: %s\n", KOMUTRACKER_VERSION, stamp, event,
+                result == 0 ? "OK" : "FAILED");
 }
 
-int tracker_session_init(tracker_session *session, http_client *client,
-                         const char *email, const tracker_options *options) {
-    memset(session, 0, sizeof(*session));
-    session->client = client;
-    session->options = *options;
+static void log_info(const char *message) {
+    if (!verbose_logging) return;
+    char stamp[16];
+    if (now_local(stamp, sizeof(stamp)) == 0)
+        fprintf(stderr, "komutracker %s [%s] %s\n", KOMUTRACKER_VERSION, stamp, message);
+}
 
-    if (get_hostname(session->hostname, sizeof(session->hostname) - 1))
-        strcpy(session->hostname, "unknown");
+/* Sleep up to `seconds`, waking early when tracking is asked to stop. */
+static void interruptible_sleep(double seconds, volatile sig_atomic_t *running,
+                                volatile sig_atomic_t *session) {
+    while (seconds > 0 && *running && *session) {
+        double step = seconds < 0.2 ? seconds : 0.2;
+        tracker_sleep(step);
+        seconds -= step;
+    }
+}
 
-    if (email && *email) {
+int tracker_run(const http_client *client, const tracker_config *config,
+                volatile sig_atomic_t *running, volatile sig_atomic_t *session) {
+    verbose_logging = config->verbose;
+    bool verbose = config->verbose;
+    char host[256] = {0}; if (get_hostname(host, sizeof(host) - 1)) strcpy(host, "unknown");
+    char name[512] = {0}, email[512] = {0};
+    int profile = http_auth_me(client, name, sizeof(name), email, sizeof(email));
+    char username[512] = {0};
+    if (profile == HTTP_AUTH_OK) {
         size_t at = strcspn(email, "@");
-        snprintf(session->username, sizeof(session->username), "%.*s", (int)at, email);
-    }
-    if (!session->username[0])
-        snprintf(session->username, sizeof(session->username), "%s", session->hostname);
-
-    snprintf(session->afk_bucket, sizeof(session->afk_bucket),
-             "aw-watcher-afk_%s", session->username);
-    snprintf(session->window_bucket, sizeof(session->window_bucket),
-             "aw-watcher-window_%s", session->username);
-
-    if (idle_init()) return -1;
-    session->idle_available = true;
-
-    /* Window tracking remains disabled until its API is implemented. */
-    session->window_available = false;
-    int result = http_create_bucket(client, session->afk_bucket,
-                                    "aw-watcher-afk", "afkstatus", session->hostname);
-    if (result) {
-        report_send(session, "create AFK bucket", result);
-        if (result == HTTP_RESULT_UNAUTHORIZED) {
-            tracker_session_cleanup(session);
-            return result;
+        snprintf(username, sizeof(username), "%.*s", (int)at, email);
+        if (verbose) {
+            char message[1080];
+            snprintf(message, sizeof(message), "logged in as %s <%s>", name, email);
+            log_info(message);
         }
+    } else {
+        strcpy(username, host);
+        if (verbose) log_info("logged-in user unavailable; using hostname for bucket name");
     }
-    if (session->window_available &&
-        (result = http_create_bucket(client, session->window_bucket,
-                                     "aw-watcher-window", "currentwindow",
-                                     session->hostname)) != HTTP_RESULT_OK) {
-        report_send(session, "create foreground-process bucket", result);
-        if (result == HTTP_RESULT_UNAUTHORIZED) {
-            tracker_session_cleanup(session);
-            return result;
-        }
+    char afk_bucket[512];
+    snprintf(afk_bucket, sizeof(afk_bucket), "aw-watcher-afk_%s", username);
+    if (verbose) {
+        char message[1080];
+        snprintf(message, sizeof(message), "afk bucket: %s", afk_bucket);
+        log_info(message);
     }
+    if (idle_init()) return 1;
+    if (http_create_bucket(client, afk_bucket, "aw-watcher-afk", "afkstatus", host) && verbose)
+        fprintf(stderr, "Unable to create AFK bucket\n");
 
-    session->next_afk = tracker_now_seconds();
-    session->next_window = session->next_afk;
-    return 0;
-}
-
-int tracker_session_poll(tracker_session *session) {
-    double now = tracker_now_seconds();
-
-    if (session->window_available && now >= session->next_window) {
-        window_info foreground;
-        if (window_get_current(&foreground)) {
-            strcpy(foreground.app, "unknown");
-            foreground.title[0] = '\0';
-        }
-        if (session->options.exclude_window_title) strcpy(foreground.title, "excluded");
-        char timestamp[32];
-        if (!afk_format_timestamp(timestamp, sizeof(timestamp), now)) {
-            int result = http_heartbeat_window(
-                session->client, session->window_bucket, timestamp,
-                foreground.app, foreground.title, session->options.window_poll_seconds + 1.0);
-            if (report_send(session, "foreground-process heartbeat", result)
-                == HTTP_RESULT_UNAUTHORIZED) return HTTP_RESULT_UNAUTHORIZED;
-        }
-        session->next_window = now + session->options.window_poll_seconds;
-    }
-
-    if (now >= session->next_afk) {
-        double idle = idle_seconds();
-        if (idle >= 0) {
-            afk_sample sample = afk_update(
-                session->afk, idle, session->options.afk_timeout_seconds);
-            double last_input = now + sample.event_offset;
-            double pulse_time = session->options.afk_timeout_seconds
-                + session->options.afk_poll_seconds;
-            char timestamp[32];
-            if (sample.changed) {
-                if (!afk_format_timestamp(timestamp, sizeof(timestamp), last_input)) {
-                    int result = report_send(session, "afk heartbeat", http_heartbeat(
-                        session->client, session->afk_bucket, timestamp, 0,
-                        session->afk, pulse_time));
-                    if (result == HTTP_RESULT_UNAUTHORIZED) return result;
-                }
-                if (!afk_format_timestamp(timestamp, sizeof(timestamp), last_input + 0.001)) {
-                    int result = report_send(session, "afk heartbeat", http_heartbeat(
-                        session->client, session->afk_bucket, timestamp, sample.duration,
-                        sample.afk, pulse_time));
-                    if (result == HTTP_RESULT_UNAUTHORIZED) return result;
-                }
-            } else if (!afk_format_timestamp(timestamp, sizeof(timestamp), last_input)) {
-                int result = report_send(session, "afk heartbeat", http_heartbeat(
-                    session->client, session->afk_bucket, timestamp, sample.duration,
-                    sample.afk, pulse_time));
-                if (result == HTTP_RESULT_UNAUTHORIZED) return result;
+    double timeout = config->timeout, poll_time = config->poll_time;
+    bool afk = false;
+    double next_afk = now_seconds(), next_minute = 0;
+    if (verbose) fprintf(stderr, "komutracker %s started for %s\n", KOMUTRACKER_VERSION, client->base_url);
+    while (*running && *session) {
+        double now = now_seconds();
+        if (now >= next_afk) {
+            double idle = idle_seconds();
+            if (idle >= 0) {
+                afk_sample sample = afk_update(afk, idle, timeout);
+                double last_input = now + sample.event_offset;
+                char timestamp[32];
+                if (sample.changed) {
+                    if (!afk_format_timestamp(timestamp, sizeof(timestamp), last_input))
+                        log_send("afk heartbeat", http_heartbeat(client, afk_bucket, timestamp, 0, afk, timeout + poll_time));
+                    if (!afk_format_timestamp(timestamp, sizeof(timestamp), last_input + 0.001))
+                        log_send("afk heartbeat", http_heartbeat(client, afk_bucket, timestamp, sample.duration, sample.afk, timeout + poll_time));
+                } else if (!afk_format_timestamp(timestamp, sizeof(timestamp), last_input))
+                    log_send("afk heartbeat", http_heartbeat(client, afk_bucket, timestamp, sample.duration, sample.afk, timeout + poll_time));
+                afk = sample.afk;
             }
-            session->afk = sample.afk;
+            next_afk = now + poll_time;
         }
-        session->next_afk = now + session->options.afk_poll_seconds;
+
+        if (config->on_minute && now >= next_minute) {
+            config->on_minute(client);
+            next_minute = now + 60;
+        }
+
+        double delay = next_afk - now_seconds();
+        if (delay < 0.01) delay = 0.01;
+        interruptible_sleep(delay, running, session);
     }
-    return HTTP_RESULT_OK;
-}
-
-double tracker_session_delay(const tracker_session *session) {
-    double next = session->next_afk;
-    if (session->window_available && session->next_window < next) next = session->next_window;
-    double delay = next - tracker_now_seconds();
-    return delay < 0.01 ? 0.01 : delay;
-}
-
-void tracker_session_cleanup(tracker_session *session) {
-    if (session->window_available) window_cleanup();
-    if (session->idle_available) idle_cleanup();
-    session->window_available = false;
-    session->idle_available = false;
+    idle_cleanup();
+    return 0;
 }
