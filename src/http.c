@@ -56,6 +56,10 @@ static int request(const http_client *client, const char *url, const char *metho
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+#ifdef _WIN32
+    /* schannel fails requests outright when the revocation server is unreachable (corporate proxies etc.) */
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_REVOKE_BEST_EFFORT);
+#endif
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transfer_progress);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "komutracker/1.0");

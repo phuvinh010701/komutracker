@@ -133,17 +133,36 @@ int auth_open_browser(const char *url) {
 #endif
 }
 
+static void sleep_ms(int ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000);
+#endif
+}
+
 int auth_login(http_client *client, const auth_options *options, char *token, size_t token_size,
                volatile sig_atomic_t *running) {
     char url[4096];
     if (auth_build_url(url, sizeof(url), options, client->device_id)) return -1;
+    /* The server only learns this device on its first poll, and the OAuth callback rejects unknown
+       devices. Register it before sending the user to the browser, and fail early if it can't. */
+    int registered = 0;
+    for (int tries = 0; *running && tries < 5 && !registered; tries++) {
+        if (http_auth_poll(client, token, token_size) != HTTP_AUTH_ERROR) registered = 1;
+        else if (tries < 4) sleep_ms(1000);
+    }
+    if (!registered) {
+        fprintf(stderr, "Unable to reach the server; check your connection and try again\n");
+        return -1;
+    }
     printf("Open this URL to log in:\n%s\n", url);
     fflush(stdout);
     if (options->open_browser && auth_open_browser(url))
         fprintf(stderr, "Unable to open a browser; open the URL manually\n");
 
     int waited = 0;
-    int attempt = 0;
+    int attempt = 0, errors = 0;
     while (*running && waited < options->timeout_seconds) {
         attempt++;
         int result = http_auth_poll(client, token, token_size);
@@ -155,7 +174,7 @@ int auth_login(http_client *client, const auth_options *options, char *token, si
             client->token = token;
             return http_auth_me(client, NULL, 0, NULL, 0) == HTTP_AUTH_OK ? 0 : -1;
         }
-        if (result == HTTP_AUTH_ERROR) {
+        if (result == HTTP_AUTH_ERROR && ++errors >= 5) {
             if (client->verbose)
                 fprintf(stderr, "komutracker %s: authentication poll failed\n", KOMUTRACKER_VERSION);
             return -1;
@@ -163,13 +182,7 @@ int auth_login(http_client *client, const auth_options *options, char *token, si
         if (client->verbose)
             fprintf(stderr, "komutracker %s: authentication poll attempt %d pending\n",
                     KOMUTRACKER_VERSION, attempt);
-        for (int tenth = 0; tenth < 20 && *running; tenth++) {
-#ifdef _WIN32
-            Sleep(100);
-#else
-            usleep(100000);
-#endif
-        }
+        for (int tenth = 0; tenth < 20 && *running; tenth++) sleep_ms(100);
         waited += 2;
     }
     if (client->verbose)
