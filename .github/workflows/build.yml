@@ -37,6 +37,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
       - name: Install static libcurl
         shell: pwsh
         run: vcpkg install curl:x64-windows-static
