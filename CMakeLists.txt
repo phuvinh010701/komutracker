@@ -39,7 +39,7 @@ if(WIN32)
     # GUI subsystem: no console window when launched from Explorer or at login.
     set_target_properties(komutracker PROPERTIES WIN32_EXECUTABLE TRUE OUTPUT_NAME KomuTracker)
     if(MSVC)
-        target_link_options(komutracker PRIVATE /ENTRYPOINT:mainCRTStartup)
+        target_link_options(komutracker PRIVATE /ENTRY:mainCRTStartup)
     endif()
 endif()
 target_include_directories(komutracker PRIVATE src)
